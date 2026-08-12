@@ -17,7 +17,7 @@ lab-client          lab-router           lab-fw              lab-server
 client -- router -- firewall -- server
 ```
 
-Stage 4 在 router namespace 内提供互斥的 SNAT、DNAT 和关闭模式；默认不启用 NAT。
+Stage 6 提供 client、router、firewall 和 server 各跳的 tcpdump 抓包与报头对比工作流。
 
 ## 仓库结构
 
@@ -32,20 +32,22 @@ Stage 4 在 router namespace 内提供互斥的 SNAT、DNAT 和关闭模式；�
         ├── stage-1.md
         ├── stage-2.md
         ├── stage-3.md
-        └── stage-4.md
+        ├── stage-4.md
+        ├── stage-5.md
+        └── stage-6.md
 ```
 
-## Stage 4 使用
+## Stage 6 使用
 
 环境检查不会修改系统。拓扑操作需要 root 权限：
 
 ```bash
 ./lab.sh check
-sudo ./lab.sh up 4
-sudo ./lab.sh nat snat
-sudo ./lab.sh nat dnat
-sudo ./lab.sh nat off
-sudo ./lab.sh test 4
+sudo ./lab.sh up 6
+sudo ./lab.sh capture start
+sudo ./lab.sh capture stop
+sudo ./lab.sh capture summary
+sudo ./lab.sh test 6
 sudo ./lab.sh status
 sudo ./lab.sh down
 ```

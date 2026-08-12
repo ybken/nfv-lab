@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly COMPLETED_STAGE=5
+readonly COMPLETED_STAGE=6
 readonly -a NAMESPACES=(lab-client lab-router lab-fw lab-server)
 readonly -a HOST_VETHS=(lab-c lab-r0 lab-r1 lab-f0 lab-f1 lab-s)
+readonly -a CAPTURE_NAMES=(client router-in router-out fw-in fw-out server)
+readonly -a CAPTURE_NAMESPACES=(lab-client lab-router lab-router lab-fw lab-fw lab-server)
+readonly -a CAPTURE_INTERFACES=(eth0 eth0 eth1 eth0 eth1 eth0)
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly RUNTIME_DIR="$SCRIPT_DIR/run"
@@ -11,28 +14,32 @@ readonly HTTP_PID_FILE="$RUNTIME_DIR/http.pid"
 readonly HTTP_LOG="$RUNTIME_DIR/http.log"
 readonly QOS_PAYLOAD="$RUNTIME_DIR/qos.bin"
 readonly QOS_READY_FILE="$RUNTIME_DIR/stage5.ready"
+readonly STAGE6_READY_FILE="$RUNTIME_DIR/stage6.ready"
+readonly CAPTURE_DIR="$SCRIPT_DIR/captures"
+readonly CAPTURE_PID_DIR="$RUNTIME_DIR/capture-pids"
 
 usage() {
     cat <<'EOF'
 Usage:
   ./lab.sh check
-  sudo ./lab.sh up <0|1|2|3|4|5>
-  sudo ./lab.sh test <0|1|2|3|4|5>
+  sudo ./lab.sh up <0|1|2|3|4|5|6>
+  sudo ./lab.sh test <0|1|2|3|4|5|6>
   sudo ./lab.sh nat <off|snat|dnat>
   sudo ./lab.sh qos off
   sudo ./lab.sh qos set <rate> <delay> <loss>
+  sudo ./lab.sh capture <start|stop|status|summary>
   sudo ./lab.sh status
   sudo ./lab.sh down
 EOF
 }
 
 check_environment() {
-    local -a required=(bash ip sysctl ping iptables curl python3 conntrack tc truncate awk)
-    local -a optional=(iperf3 tcpdump shellcheck)
+    local -a required=(bash ip sysctl ping iptables curl python3 conntrack tc truncate awk tcpdump)
+    local -a optional=(iperf3 shellcheck)
     local tool
     local missing=0
 
-    printf 'Required tools through Stage 5:\n'
+    printf 'Required tools through Stage 6:\n'
     for tool in "${required[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -57,8 +64,8 @@ check_environment() {
 require_supported_stage() {
     local stage=${1:-}
 
-    if [[ ! "$stage" =~ ^[012345]$ ]]; then
-        printf 'Supported stages: 0 through 5; requested stage: %s\n' "${stage:-<missing>}" >&2
+    if [[ ! "$stage" =~ ^[0123456]$ ]]; then
+        printf 'Supported stages: 0 through 6; requested stage: %s\n' "${stage:-<missing>}" >&2
         return 2
     fi
 }
@@ -107,12 +114,55 @@ stop_http_server() {
     rm -f "$HTTP_PID_FILE"
 }
 
+is_project_capture_pid() {
+    local pid=$1
+    local command_line
+
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    command_line=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    [[ "$command_line" == *"tcpdump"* && "$command_line" == *"$CAPTURE_DIR/"* ]]
+}
+
+stop_captures() {
+    local pid_file
+    local pid
+    local namespace
+    local -a pids=()
+
+    if [[ -d "$CAPTURE_PID_DIR" ]]; then
+        for pid_file in "$CAPTURE_PID_DIR"/*.pid; do
+            [[ -e "$pid_file" ]] || continue
+            pid=$(<"$pid_file")
+            pids+=("$pid")
+            rm -f "$pid_file"
+        done
+        rmdir "$CAPTURE_PID_DIR" 2>/dev/null || true
+    fi
+
+    for namespace in "${NAMESPACES[@]}"; do
+        if namespace_exists "$namespace"; then
+            mapfile -t namespace_pids < <(ip netns pids "$namespace")
+            pids+=("${namespace_pids[@]}")
+        fi
+    done
+
+    for pid in "${pids[@]}"; do
+        if is_project_capture_pid "$pid"; then
+            kill -INT "$pid" 2>/dev/null || true
+        fi
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
 cleanup_stage_one() {
     local namespace
     local link
 
+    stop_captures
     stop_http_server
-    rm -f "$QOS_PAYLOAD" "$QOS_READY_FILE"
+    rm -f "$QOS_PAYLOAD" "$QOS_READY_FILE" "$STAGE6_READY_FILE"
 
     for namespace in "${NAMESPACES[@]}"; do
         if namespace_exists "$namespace"; then
@@ -386,6 +436,20 @@ setup_stage_five() {
     printf 'Stage 5 is up with QoS disabled by default.\n'
 }
 
+setup_stage_six() {
+    trap 'cleanup_stage_one' ERR
+
+    setup_stage_five
+    trap 'cleanup_stage_one' ERR
+
+    mkdir -p "$RUNTIME_DIR"
+    touch "$STAGE6_READY_FILE"
+    stop_captures
+
+    trap - ERR
+    printf 'Stage 6 is up with packet capture stopped.\n'
+}
+
 require_stage_one_topology() {
     local namespace
 
@@ -414,6 +478,80 @@ require_stage_five_topology() {
         printf 'Stage 5 is not active. Run: sudo ./lab.sh up 5\n' >&2
         return 1
     fi
+}
+
+require_stage_six_topology() {
+    require_stage_five_topology
+    if [[ ! -f "$STAGE6_READY_FILE" ]]; then
+        printf 'Stage 6 is not active. Run: sudo ./lab.sh up 6\n' >&2
+        return 1
+    fi
+}
+
+start_captures() {
+    local index
+    local name
+    local namespace
+    local interface
+    local pid
+
+    stop_captures
+    mkdir -p "$CAPTURE_DIR" "$CAPTURE_PID_DIR"
+
+    for index in "${!CAPTURE_NAMES[@]}"; do
+        name=${CAPTURE_NAMES[$index]}
+        namespace=${CAPTURE_NAMESPACES[$index]}
+        interface=${CAPTURE_INTERFACES[$index]}
+        rm -f "$CAPTURE_DIR/$name.pcap" "$CAPTURE_DIR/$name.log"
+        ip netns exec "$namespace" tcpdump -U -n -i "$interface" -s 0 \
+            -w "$CAPTURE_DIR/$name.pcap" \
+            'icmp or tcp port 8080' >"$CAPTURE_DIR/$name.log" 2>&1 &
+        pid=$!
+        printf '%s\n' "$pid" >"$CAPTURE_PID_DIR/$name.pid"
+    done
+
+    sleep 0.3
+    for name in "${CAPTURE_NAMES[@]}"; do
+        pid=$(<"$CAPTURE_PID_DIR/$name.pid")
+        if ! is_project_capture_pid "$pid"; then
+            printf 'Capture failed to start: %s; see %s.\n' \
+                "$name" "$CAPTURE_DIR/$name.log" >&2
+            stop_captures
+            return 1
+        fi
+    done
+    printf 'Packet capture started in %s.\n' "$CAPTURE_DIR"
+}
+
+show_capture_status() {
+    local name
+    local pid
+
+    for name in "${CAPTURE_NAMES[@]}"; do
+        if [[ -r "$CAPTURE_PID_DIR/$name.pid" ]]; then
+            pid=$(<"$CAPTURE_PID_DIR/$name.pid")
+            if is_project_capture_pid "$pid"; then
+                printf '%-10s running pid=%s\n' "$name" "$pid"
+                continue
+            fi
+        fi
+        printf '%-10s stopped\n' "$name"
+    done
+}
+
+summarize_captures() {
+    local name
+    local capture
+
+    for name in "${CAPTURE_NAMES[@]}"; do
+        capture="$CAPTURE_DIR/$name.pcap"
+        if [[ ! -s "$capture" ]]; then
+            printf 'Missing or empty capture: %s\n' "$capture" >&2
+            return 1
+        fi
+        printf '\n[%s]\n' "$name"
+        tcpdump -e -n -r "$capture" -c 8 2>/dev/null
+    done
 }
 
 test_forwarding_disabled() {
@@ -612,6 +750,30 @@ test_stage_five() {
     trap - ERR
 }
 
+test_stage_six() {
+    local name
+
+    require_stage_six_topology
+    trap 'stop_captures' ERR
+
+    start_captures
+    ip netns exec lab-client ping -c 2 -W 1 10.10.3.2
+    ip netns exec lab-client curl -fsS --max-time 3 \
+        http://10.10.3.2:8080/docs/STATE.md >/dev/null
+    sleep 0.2
+    stop_captures
+
+    for name in "${CAPTURE_NAMES[@]}"; do
+        if [[ ! -s "$CAPTURE_DIR/$name.pcap" ]]; then
+            printf 'Capture is empty: %s.pcap\n' "$name" >&2
+            return 1
+        fi
+        tcpdump -n -r "$CAPTURE_DIR/$name.pcap" -c 1 >/dev/null 2>&1
+    done
+    summarize_captures
+    trap - ERR
+}
+
 show_status() {
     local namespace
 
@@ -646,6 +808,10 @@ show_status() {
     if [[ -r "$HTTP_PID_FILE" ]]; then
         printf '\nHTTP PID: %s\n' "$(<"$HTTP_PID_FILE")"
     fi
+    if [[ -f "$STAGE6_READY_FILE" ]]; then
+        printf '\n[packet capture]\n'
+        show_capture_status
+    fi
 }
 
 main() {
@@ -668,6 +834,7 @@ main() {
                 3) require_root; setup_stage_three ;;
                 4) require_root; setup_stage_four ;;
                 5) require_root; setup_stage_five ;;
+                6) require_root; setup_stage_six ;;
             esac
             ;;
         test)
@@ -681,6 +848,7 @@ main() {
                 3) require_root; test_stage_three ;;
                 4) require_root; test_stage_four ;;
                 5) require_root; test_stage_five ;;
+                6) require_root; test_stage_six ;;
             esac
             ;;
         nat)
@@ -701,6 +869,21 @@ main() {
                     [[ $# -eq 5 ]] || { usage >&2; return 2; }
                     set_qos "$3" "$4" "$5"
                     ;;
+                *)
+                    usage >&2
+                    return 2
+                    ;;
+            esac
+            ;;
+        capture)
+            [[ $# -eq 2 ]] || { usage >&2; return 2; }
+            require_root
+            require_stage_six_topology
+            case "$2" in
+                start) start_captures ;;
+                stop) stop_captures ;;
+                status) show_capture_status ;;
+                summary) summarize_captures ;;
                 *)
                     usage >&2
                     return 2

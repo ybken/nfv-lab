@@ -14,14 +14,14 @@ Stage 2 routing remains. The firewall `FORWARD` chain now:
 4. rejects other client-to-server TCP with a TCP reset;
 5. drops new server-to-client traffic and any remaining unmatched traffic.
 
-A Python HTTP server runs inside `lab-server` and serves the `docs/` directory.
+A Python HTTP server runs inside `lab-server`; the lab documents are available under `/docs/`.
 
 ## Important commands
 
 ```bash
 sudo ./lab.sh up 3
 sudo ip netns exec lab-fw iptables -L FORWARD -v -n --line-numbers
-sudo ip netns exec lab-client curl http://10.10.3.2:8080/STATE.md
+sudo ip netns exec lab-client curl http://10.10.3.2:8080/docs/STATE.md
 ```
 
 ## Verification
@@ -50,4 +50,3 @@ Ping and HTTP succeed. TCP/8081 is rejected, an unsolicited server-to-client con
 - Rule order places DROP before an allow rule.
 - Conntrack support is unavailable in the kernel.
 - A stale topology is active; run `sudo ./lab.sh down`, then retry.
-
