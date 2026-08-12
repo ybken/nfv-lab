@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly COMPLETED_STAGE=2
+readonly COMPLETED_STAGE=3
 readonly -a NAMESPACES=(lab-client lab-router lab-fw lab-server)
 readonly -a HOST_VETHS=(lab-c lab-r0 lab-r1 lab-f0 lab-f1 lab-s)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
+readonly RUNTIME_DIR="$SCRIPT_DIR/run"
+readonly HTTP_PID_FILE="$RUNTIME_DIR/http.pid"
+readonly HTTP_LOG="$RUNTIME_DIR/http.log"
 
 usage() {
     cat <<'EOF'
 Usage:
   ./lab.sh check
-  sudo ./lab.sh up <0|1|2>
-  sudo ./lab.sh test <0|1|2>
+  sudo ./lab.sh up <0|1|2|3>
+  sudo ./lab.sh test <0|1|2|3>
   sudo ./lab.sh status
   sudo ./lab.sh down
 EOF
 }
 
 check_environment() {
-    local -a required=(bash ip sysctl ping)
-    local -a optional=(iptables tc curl iperf3 tcpdump conntrack shellcheck)
+    local -a required=(bash ip sysctl ping iptables curl python3)
+    local -a optional=(tc iperf3 tcpdump conntrack shellcheck)
     local tool
     local missing=0
 
-    printf 'Required tools through Stage 2:\n'
+    printf 'Required tools through Stage 3:\n'
     for tool in "${required[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -47,8 +52,8 @@ check_environment() {
 require_supported_stage() {
     local stage=${1:-}
 
-    if [[ ! "$stage" =~ ^[012]$ ]]; then
-        printf 'Supported stages: 0, 1, and 2; requested stage: %s\n' "${stage:-<missing>}" >&2
+    if [[ ! "$stage" =~ ^[0123]$ ]]; then
+        printf 'Supported stages: 0 through 3; requested stage: %s\n' "${stage:-<missing>}" >&2
         return 2
     fi
 }
@@ -65,9 +70,43 @@ namespace_exists() {
     [[ -e "/run/netns/$namespace" ]]
 }
 
+is_project_http_pid() {
+    local pid=$1
+    local command_line
+
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    command_line=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    [[ "$command_line" == *"python3 -m http.server 8080"* &&
+        "$command_line" == *"--directory $SCRIPT_DIR/docs"* ]]
+}
+
+stop_http_server() {
+    local pid
+    local -a pids=()
+
+    if [[ -r "$HTTP_PID_FILE" ]]; then
+        pid=$(<"$HTTP_PID_FILE")
+        pids+=("$pid")
+    fi
+    if namespace_exists lab-server; then
+        mapfile -t namespace_pids < <(ip netns pids lab-server)
+        pids+=("${namespace_pids[@]}")
+    fi
+
+    for pid in "${pids[@]}"; do
+        if is_project_http_pid "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -f "$HTTP_PID_FILE"
+}
+
 cleanup_stage_one() {
     local namespace
     local link
+
+    stop_http_server
 
     for namespace in "${NAMESPACES[@]}"; do
         if namespace_exists "$namespace"; then
@@ -154,6 +193,71 @@ setup_stage_two() {
 
     trap - ERR
     printf 'Stage 2 routing is up.\n'
+}
+
+configure_stage_three_acl() {
+    ip netns exec lab-fw iptables -F
+    ip netns exec lab-fw iptables -X
+    ip netns exec lab-fw iptables -P INPUT ACCEPT
+    ip netns exec lab-fw iptables -P OUTPUT ACCEPT
+    ip netns exec lab-fw iptables -P FORWARD DROP
+
+    ip netns exec lab-fw iptables -A FORWARD \
+        -m conntrack --ctstate ESTABLISHED,RELATED \
+        -m comment --comment stage3-established -j ACCEPT
+    ip netns exec lab-fw iptables -A FORWARD \
+        -p icmp -m comment --comment stage3-icmp -j ACCEPT
+    ip netns exec lab-fw iptables -A FORWARD \
+        -i eth0 -o eth1 -s 10.10.1.2 -d 10.10.3.2 \
+        -p tcp --dport 8080 -m conntrack --ctstate NEW \
+        -m comment --comment stage3-http-new -j ACCEPT
+    ip netns exec lab-fw iptables -A FORWARD \
+        -i eth0 -o eth1 -s 10.10.1.2 -d 10.10.3.2 \
+        -p tcp -m comment --comment stage3-reject-other-tcp \
+        -j REJECT --reject-with tcp-reset
+    ip netns exec lab-fw iptables -A FORWARD \
+        -i eth1 -o eth0 -s 10.10.3.2 -d 10.10.1.2 \
+        -m conntrack --ctstate NEW \
+        -m comment --comment stage3-drop-new -j DROP
+}
+
+start_http_server() {
+    mkdir -p "$RUNTIME_DIR"
+    stop_http_server
+
+    ip netns exec lab-server python3 -m http.server 8080 \
+        --bind 10.10.3.2 --directory "$SCRIPT_DIR/docs" \
+        >"$HTTP_LOG" 2>&1 &
+    printf '%s\n' "$!" >"$HTTP_PID_FILE"
+}
+
+wait_for_http_server() {
+    local attempt
+
+    for ((attempt = 1; attempt <= 10; attempt++)); do
+        if ip netns exec lab-client curl -fsS --max-time 1 \
+            http://10.10.3.2:8080/STATE.md >/dev/null; then
+            return
+        fi
+        sleep 0.1
+    done
+
+    printf 'HTTP server did not become reachable; see %s.\n' "$HTTP_LOG" >&2
+    return 1
+}
+
+setup_stage_three() {
+    trap 'cleanup_stage_one' ERR
+
+    setup_stage_two
+    trap 'cleanup_stage_one' ERR
+
+    configure_stage_three_acl
+    start_http_server
+    wait_for_http_server
+
+    trap - ERR
+    printf 'Stage 3 firewall and HTTP service are up.\n'
 }
 
 require_stage_one_topology() {
@@ -244,6 +348,47 @@ test_stage_two() {
     ip -n lab-server route show
 }
 
+expect_curl_failure() {
+    local namespace=$1
+    local url=$2
+    local description=$3
+
+    if ip netns exec "$namespace" curl -fsS --connect-timeout 2 \
+        --max-time 2 "$url" >/dev/null 2>&1; then
+        printf 'Unexpected success: %s.\n' "$description" >&2
+        return 1
+    fi
+    printf '[ok] %s\n' "$description"
+}
+
+test_stage_three() {
+    local response
+
+    require_stage_one_topology
+    assert_forwarding lab-client 0
+    assert_forwarding lab-router 1
+    assert_forwarding lab-fw 1
+    assert_forwarding lab-server 0
+
+    ip netns exec lab-client ping -c 2 -W 1 10.10.3.2
+
+    response=$(ip netns exec lab-client curl -fsS --max-time 3 \
+        http://10.10.3.2:8080/STATE.md)
+    if [[ "$response" != *"Current completed stage: Stage 3"* ]]; then
+        printf 'Unexpected HTTP response from server.\n' >&2
+        return 1
+    fi
+    printf '[ok] HTTP NEW request and ESTABLISHED response on TCP/8080\n'
+
+    expect_curl_failure lab-client http://10.10.3.2:8081/ \
+        'other client-to-server TCP is rejected'
+    expect_curl_failure lab-server http://10.10.1.2:8080/ \
+        'new server-to-client traffic is dropped'
+
+    printf '\nStage 3 firewall counters:\n'
+    ip netns exec lab-fw iptables -L FORWARD -v -n --line-numbers
+}
+
 show_status() {
     local namespace
 
@@ -259,6 +404,14 @@ show_status() {
             printf '\n[%s] absent\n' "$namespace"
         fi
     done
+
+    if namespace_exists lab-fw; then
+        printf '\n[lab-fw filter/FORWARD]\n'
+        ip netns exec lab-fw iptables -L FORWARD -v -n --line-numbers
+    fi
+    if [[ -r "$HTTP_PID_FILE" ]]; then
+        printf '\nHTTP PID: %s\n' "$(<"$HTTP_PID_FILE")"
+    fi
 }
 
 main() {
@@ -278,6 +431,7 @@ main() {
             case "$stage" in
                 1) require_root; setup_stage_one ;;
                 2) require_root; setup_stage_two ;;
+                3) require_root; setup_stage_three ;;
             esac
             ;;
         test)
@@ -288,6 +442,7 @@ main() {
             case "$stage" in
                 1) require_root; test_stage_one ;;
                 2) require_root; test_stage_two ;;
+                3) require_root; test_stage_three ;;
             esac
             ;;
         status)
