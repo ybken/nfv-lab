@@ -1,0 +1,12 @@
+# Runtime artifacts produced by later lab stages
+captures/
+logs/
+run/
+*.pcap
+*.pid
+
+# Editor and OS metadata
+.DS_Store
+*.swp
+*~
+
