@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly COMPLETED_STAGE=3
+readonly COMPLETED_STAGE=4
 readonly -a NAMESPACES=(lab-client lab-router lab-fw lab-server)
 readonly -a HOST_VETHS=(lab-c lab-r0 lab-r1 lab-f0 lab-f1 lab-s)
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -14,20 +14,21 @@ usage() {
     cat <<'EOF'
 Usage:
   ./lab.sh check
-  sudo ./lab.sh up <0|1|2|3>
-  sudo ./lab.sh test <0|1|2|3>
+  sudo ./lab.sh up <0|1|2|3|4>
+  sudo ./lab.sh test <0|1|2|3|4>
+  sudo ./lab.sh nat <off|snat|dnat>
   sudo ./lab.sh status
   sudo ./lab.sh down
 EOF
 }
 
 check_environment() {
-    local -a required=(bash ip sysctl ping iptables curl python3)
-    local -a optional=(tc iperf3 tcpdump conntrack shellcheck)
+    local -a required=(bash ip sysctl ping iptables curl python3 conntrack)
+    local -a optional=(tc iperf3 tcpdump shellcheck)
     local tool
     local missing=0
 
-    printf 'Required tools through Stage 3:\n'
+    printf 'Required tools through Stage 4:\n'
     for tool in "${required[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -52,8 +53,8 @@ check_environment() {
 require_supported_stage() {
     local stage=${1:-}
 
-    if [[ ! "$stage" =~ ^[0123]$ ]]; then
-        printf 'Supported stages: 0 through 3; requested stage: %s\n' "${stage:-<missing>}" >&2
+    if [[ ! "$stage" =~ ^[01234]$ ]]; then
+        printf 'Supported stages: 0 through 4; requested stage: %s\n' "${stage:-<missing>}" >&2
         return 2
     fi
 }
@@ -260,6 +261,75 @@ setup_stage_three() {
     printf 'Stage 3 firewall and HTTP service are up.\n'
 }
 
+configure_stage_four_acl() {
+    configure_stage_three_acl
+    ip netns exec lab-fw iptables -I FORWARD 4 \
+        -i eth0 -o eth1 -s 10.10.2.1 -d 10.10.3.2 \
+        -p tcp --dport 8080 -m conntrack --ctstate NEW \
+        -m comment --comment stage4-snat-http-new -j ACCEPT
+}
+
+set_nat_mode() {
+    local mode=$1
+
+    case "$mode" in
+        off | snat | dnat) ;;
+        *)
+            printf 'NAT modes: off, snat, or dnat; requested mode: %s\n' "$mode" >&2
+            return 2
+            ;;
+    esac
+
+    ip netns exec lab-router iptables -t nat -F
+    ip netns exec lab-router iptables -t nat -X
+    ip netns exec lab-router conntrack -F >/dev/null
+
+    case "$mode" in
+        snat)
+            ip netns exec lab-router iptables -t nat -A POSTROUTING \
+                -s 10.10.1.2 -d 10.10.3.2 -o eth1 \
+                -p tcp --dport 8080 \
+                -m comment --comment stage4-snat \
+                -j SNAT --to-source 10.10.2.1
+            ;;
+        dnat)
+            ip netns exec lab-router iptables -t nat -A PREROUTING \
+                -i eth0 -d 10.10.1.1 \
+                -p tcp --dport 8080 \
+                -m comment --comment stage4-dnat \
+                -j DNAT --to-destination 10.10.3.2:8080
+            ;;
+    esac
+
+    printf 'NAT mode: %s\n' "$mode"
+}
+
+show_nat_mode() {
+    local rules
+
+    rules=$(ip netns exec lab-router iptables -t nat -S)
+    if [[ "$rules" == *"stage4-snat"* ]]; then
+        printf 'snat'
+    elif [[ "$rules" == *"stage4-dnat"* ]]; then
+        printf 'dnat'
+    else
+        printf 'off'
+    fi
+}
+
+setup_stage_four() {
+    trap 'cleanup_stage_one' ERR
+
+    setup_stage_three
+    trap 'cleanup_stage_one' ERR
+
+    configure_stage_four_acl
+    set_nat_mode off
+
+    trap - ERR
+    printf 'Stage 4 is up with NAT disabled by default.\n'
+}
+
 require_stage_one_topology() {
     local namespace
 
@@ -269,6 +339,17 @@ require_stage_one_topology() {
             return 1
         fi
     done
+}
+
+require_stage_four_topology() {
+    local rules
+
+    require_stage_one_topology
+    rules=$(ip netns exec lab-fw iptables -S FORWARD)
+    if [[ "$rules" != *"stage4-snat-http-new"* ]]; then
+        printf 'Stage 4 is not active. Run: sudo ./lab.sh up 4\n' >&2
+        return 1
+    fi
 }
 
 test_forwarding_disabled() {
@@ -374,7 +455,7 @@ test_stage_three() {
 
     response=$(ip netns exec lab-client curl -fsS --max-time 3 \
         http://10.10.3.2:8080/STATE.md)
-    if [[ "$response" != *"Current completed stage: Stage 3"* ]]; then
+    if [[ "$response" != *"# Project State"* ]]; then
         printf 'Unexpected HTTP response from server.\n' >&2
         return 1
     fi
@@ -387,6 +468,51 @@ test_stage_three() {
 
     printf '\nStage 3 firewall counters:\n'
     ip netns exec lab-fw iptables -L FORWARD -v -n --line-numbers
+}
+
+assert_conntrack_contains() {
+    local entries=$1
+    local expected=$2
+    local description=$3
+
+    if [[ "$entries" != *"$expected"* ]]; then
+        printf 'Missing conntrack observation for %s: %s\n' \
+            "$description" "$expected" >&2
+        return 1
+    fi
+}
+
+test_stage_four() {
+    local response
+    local entries
+
+    require_stage_four_topology
+    trap 'set_nat_mode off' ERR
+
+    set_nat_mode snat
+    response=$(ip netns exec lab-client curl -fsS --max-time 3 \
+        http://10.10.3.2:8080/STATE.md)
+    [[ "$response" == *"# Project State"* ]]
+    entries=$(ip netns exec lab-router conntrack -L -p tcp --dport 8080 2>/dev/null)
+    assert_conntrack_contains "$entries" 'src=10.10.1.2 dst=10.10.3.2' SNAT
+    assert_conntrack_contains "$entries" 'src=10.10.3.2 dst=10.10.2.1' SNAT
+    printf '[ok] SNAT changed the reply destination to 10.10.2.1 in conntrack\n'
+    ip netns exec lab-router iptables -t nat -L POSTROUTING -v -n --line-numbers
+    printf '%s\n' "$entries"
+
+    set_nat_mode dnat
+    response=$(ip netns exec lab-client curl -fsS --max-time 3 \
+        http://10.10.1.1:8080/STATE.md)
+    [[ "$response" == *"# Project State"* ]]
+    entries=$(ip netns exec lab-router conntrack -L -p tcp --dport 8080 2>/dev/null)
+    assert_conntrack_contains "$entries" 'src=10.10.1.2 dst=10.10.1.1' DNAT
+    assert_conntrack_contains "$entries" 'src=10.10.3.2 dst=10.10.1.2' DNAT
+    printf '[ok] DNAT mapped 10.10.1.1:8080 to server TCP/8080\n'
+    ip netns exec lab-router iptables -t nat -L PREROUTING -v -n --line-numbers
+    printf '%s\n' "$entries"
+
+    set_nat_mode off
+    trap - ERR
 }
 
 show_status() {
@@ -408,6 +534,13 @@ show_status() {
     if namespace_exists lab-fw; then
         printf '\n[lab-fw filter/FORWARD]\n'
         ip netns exec lab-fw iptables -L FORWARD -v -n --line-numbers
+    fi
+    if namespace_exists lab-router; then
+        printf '\n[lab-router NAT]\n'
+        printf 'Mode: '
+        show_nat_mode
+        printf '\n'
+        ip netns exec lab-router iptables -t nat -L -v -n --line-numbers
     fi
     if [[ -r "$HTTP_PID_FILE" ]]; then
         printf '\nHTTP PID: %s\n' "$(<"$HTTP_PID_FILE")"
@@ -432,6 +565,7 @@ main() {
                 1) require_root; setup_stage_one ;;
                 2) require_root; setup_stage_two ;;
                 3) require_root; setup_stage_three ;;
+                4) require_root; setup_stage_four ;;
             esac
             ;;
         test)
@@ -443,7 +577,14 @@ main() {
                 1) require_root; test_stage_one ;;
                 2) require_root; test_stage_two ;;
                 3) require_root; test_stage_three ;;
+                4) require_root; test_stage_four ;;
             esac
+            ;;
+        nat)
+            [[ $# -eq 2 ]] || { usage >&2; return 2; }
+            require_root
+            require_stage_four_topology
+            set_nat_mode "$2"
             ;;
         status)
             [[ $# -eq 1 ]] || { usage >&2; return 2; }

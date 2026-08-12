@@ -17,7 +17,7 @@ lab-client          lab-router           lab-fw              lab-server
 client -- router -- firewall -- server
 ```
 
-Stage 3 在 firewall namespace 内增加有状态 ACL，并在 server 的 TCP/8080 提供 HTTP；尚未添加 NAT。
+Stage 4 在 router namespace 内提供互斥的 SNAT、DNAT 和关闭模式；默认不启用 NAT。
 
 ## 仓库结构
 
@@ -31,17 +31,21 @@ Stage 3 在 firewall namespace 内增加有状态 ACL，并在 server 的 TCP/80
         ├── stage-0.md
         ├── stage-1.md
         ├── stage-2.md
-        └── stage-3.md
+        ├── stage-3.md
+        └── stage-4.md
 ```
 
-## Stage 3 使用
+## Stage 4 使用
 
 环境检查不会修改系统。拓扑操作需要 root 权限：
 
 ```bash
 ./lab.sh check
-sudo ./lab.sh up 3
-sudo ./lab.sh test 3
+sudo ./lab.sh up 4
+sudo ./lab.sh nat snat
+sudo ./lab.sh nat dnat
+sudo ./lab.sh nat off
+sudo ./lab.sh test 4
 sudo ./lab.sh status
 sudo ./lab.sh down
 ```
