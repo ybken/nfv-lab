@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly COMPLETED_STAGE=6
+readonly COMPLETED_STAGE=7
 readonly -a NAMESPACES=(lab-client lab-router lab-fw lab-server)
 readonly -a HOST_VETHS=(lab-c lab-r0 lab-r1 lab-f0 lab-f1 lab-s)
 readonly -a CAPTURE_NAMES=(client router-in router-out fw-in fw-out server)
@@ -12,9 +12,12 @@ readonly SCRIPT_DIR
 readonly RUNTIME_DIR="$SCRIPT_DIR/run"
 readonly HTTP_PID_FILE="$RUNTIME_DIR/http.pid"
 readonly HTTP_LOG="$RUNTIME_DIR/http.log"
+readonly IPERF_PID_FILE="$RUNTIME_DIR/iperf3.pid"
+readonly IPERF_LOG="$RUNTIME_DIR/iperf3.log"
 readonly QOS_PAYLOAD="$RUNTIME_DIR/qos.bin"
 readonly QOS_READY_FILE="$RUNTIME_DIR/stage5.ready"
 readonly STAGE6_READY_FILE="$RUNTIME_DIR/stage6.ready"
+readonly STAGE7_READY_FILE="$RUNTIME_DIR/stage7.ready"
 readonly CAPTURE_DIR="$SCRIPT_DIR/captures"
 readonly CAPTURE_PID_DIR="$RUNTIME_DIR/capture-pids"
 
@@ -22,8 +25,8 @@ usage() {
     cat <<'EOF'
 Usage:
   ./lab.sh check
-  sudo ./lab.sh up <0|1|2|3|4|5|6>
-  sudo ./lab.sh test <0|1|2|3|4|5|6>
+  sudo ./lab.sh up <0|1|2|3|4|5|6|7>
+  sudo ./lab.sh test <0|1|2|3|4|5|6|7>
   sudo ./lab.sh nat <off|snat|dnat>
   sudo ./lab.sh qos off
   sudo ./lab.sh qos set <rate> <delay> <loss>
@@ -34,12 +37,12 @@ EOF
 }
 
 check_environment() {
-    local -a required=(bash ip sysctl ping iptables curl python3 conntrack tc truncate awk tcpdump)
-    local -a optional=(iperf3 shellcheck)
+    local -a required=(bash ip sysctl ping iptables curl python3 conntrack tc truncate awk tcpdump iperf3)
+    local -a optional=(shellcheck)
     local tool
     local missing=0
 
-    printf 'Required tools through Stage 6:\n'
+    printf 'Required tools through Stage 7:\n'
     for tool in "${required[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -49,7 +52,7 @@ check_environment() {
         fi
     done
 
-    printf 'Optional tools for later stages:\n'
+    printf 'Optional static validation tools:\n'
     for tool in "${optional[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -64,8 +67,8 @@ check_environment() {
 require_supported_stage() {
     local stage=${1:-}
 
-    if [[ ! "$stage" =~ ^[0123456]$ ]]; then
-        printf 'Supported stages: 0 through 6; requested stage: %s\n' "${stage:-<missing>}" >&2
+    if [[ ! "$stage" =~ ^[01234567]$ ]]; then
+        printf 'Supported stages: 0 through 7; requested stage: %s\n' "${stage:-<missing>}" >&2
         return 2
     fi
 }
@@ -112,6 +115,37 @@ stop_http_server() {
         fi
     done
     rm -f "$HTTP_PID_FILE"
+}
+
+is_project_iperf_pid() {
+    local pid=$1
+    local command_line
+
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    command_line=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    [[ "$command_line" == *"iperf3 -s"* ]]
+}
+
+stop_iperf_server() {
+    local pid
+    local -a pids=()
+
+    if [[ -r "$IPERF_PID_FILE" ]]; then
+        pid=$(<"$IPERF_PID_FILE")
+        pids+=("$pid")
+    fi
+    if namespace_exists lab-server; then
+        mapfile -t namespace_pids < <(ip netns pids lab-server)
+        pids+=("${namespace_pids[@]}")
+    fi
+
+    for pid in "${pids[@]}"; do
+        if is_project_iperf_pid "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -f "$IPERF_PID_FILE"
 }
 
 is_project_capture_pid() {
@@ -161,8 +195,9 @@ cleanup_stage_one() {
     local link
 
     stop_captures
+    stop_iperf_server
     stop_http_server
-    rm -f "$QOS_PAYLOAD" "$QOS_READY_FILE" "$STAGE6_READY_FILE"
+    rm -f "$QOS_PAYLOAD" "$QOS_READY_FILE" "$STAGE6_READY_FILE" "$STAGE7_READY_FILE"
 
     for namespace in "${NAMESPACES[@]}"; do
         if namespace_exists "$namespace"; then
@@ -176,6 +211,30 @@ cleanup_stage_one() {
             ip link delete "$link"
         fi
     done
+}
+
+verify_cleanup() {
+    local namespace
+    local link
+
+    for namespace in "${NAMESPACES[@]}"; do
+        if namespace_exists "$namespace"; then
+            printf 'Cleanup failed; namespace remains: %s\n' "$namespace" >&2
+            return 1
+        fi
+    done
+    for link in "${HOST_VETHS[@]}"; do
+        if ip link show dev "$link" >/dev/null 2>&1; then
+            printf 'Cleanup failed; host link remains: %s\n' "$link" >&2
+            return 1
+        fi
+    done
+    if [[ -e "$HTTP_PID_FILE" || -e "$IPERF_PID_FILE" || -d "$CAPTURE_PID_DIR" ||
+        -e "$QOS_PAYLOAD" || -e "$QOS_READY_FILE" ||
+        -e "$STAGE6_READY_FILE" || -e "$STAGE7_READY_FILE" ]]; then
+        printf 'Cleanup failed; a project PID record remains.\n' >&2
+        return 1
+    fi
 }
 
 create_namespaces() {
@@ -450,6 +509,41 @@ setup_stage_six() {
     printf 'Stage 6 is up with packet capture stopped.\n'
 }
 
+configure_stage_seven_acl() {
+    configure_stage_four_acl
+    ip netns exec lab-fw iptables -I FORWARD 5 \
+        -i eth0 -o eth1 -s 10.10.1.2 -d 10.10.3.2 \
+        -p tcp --dport 5201 -m conntrack --ctstate NEW \
+        -m comment --comment stage7-iperf-new -j ACCEPT
+}
+
+start_iperf_server() {
+    mkdir -p "$RUNTIME_DIR"
+    stop_iperf_server
+
+    ip netns exec lab-server iperf3 -s >"$IPERF_LOG" 2>&1 &
+    printf '%s\n' "$!" >"$IPERF_PID_FILE"
+    sleep 0.2
+    if ! is_project_iperf_pid "$!"; then
+        printf 'iperf3 server failed to start; see %s.\n' "$IPERF_LOG" >&2
+        return 1
+    fi
+}
+
+setup_stage_seven() {
+    trap 'cleanup_stage_one' ERR
+
+    setup_stage_six
+    trap 'cleanup_stage_one' ERR
+
+    configure_stage_seven_acl
+    start_iperf_server
+    touch "$STAGE7_READY_FILE"
+
+    trap - ERR
+    printf 'Stage 7 lab is up; NAT, QoS, and capture are off.\n'
+}
+
 require_stage_one_topology() {
     local namespace
 
@@ -484,6 +578,27 @@ require_stage_six_topology() {
     require_stage_five_topology
     if [[ ! -f "$STAGE6_READY_FILE" ]]; then
         printf 'Stage 6 is not active. Run: sudo ./lab.sh up 6\n' >&2
+        return 1
+    fi
+}
+
+require_stage_seven_topology() {
+    local pid
+    local rules
+
+    require_stage_six_topology
+    rules=$(ip netns exec lab-fw iptables -S FORWARD)
+    if [[ ! -f "$STAGE7_READY_FILE" || "$rules" != *"stage7-iperf-new"* ]]; then
+        printf 'Stage 7 is not active. Run: sudo ./lab.sh up 7\n' >&2
+        return 1
+    fi
+    if [[ ! -r "$IPERF_PID_FILE" ]]; then
+        printf 'iperf3 PID file is missing. Run: sudo ./lab.sh up 7\n' >&2
+        return 1
+    fi
+    pid=$(<"$IPERF_PID_FILE")
+    if ! is_project_iperf_pid "$pid"; then
+        printf 'iperf3 server is not running. Run: sudo ./lab.sh up 7\n' >&2
         return 1
     fi
 }
@@ -604,6 +719,26 @@ assert_route() {
     if [[ "$actual" != "$expected" ]]; then
         printf 'Unexpected route in %s for %s.\nExpected: %s\nActual:   %s\n' \
             "$namespace" "$destination" "$expected" "${actual:-<missing>}" >&2
+        return 1
+    fi
+}
+
+assert_interface() {
+    local namespace=$1
+    local interface=$2
+    local address=$3
+    local link
+    local addresses
+
+    link=$(ip -o -n "$namespace" link show dev "$interface")
+    addresses=$(ip -o -4 -n "$namespace" address show dev "$interface")
+    if [[ "$link" != *"<"*",UP,"* && "$link" != *"<UP,"* ]]; then
+        printf 'Interface is not up: %s/%s.\n' "$namespace" "$interface" >&2
+        return 1
+    fi
+    if [[ "$addresses" != *"inet $address "* ]]; then
+        printf 'Missing address %s on %s/%s.\n' \
+            "$address" "$namespace" "$interface" >&2
         return 1
     fi
 }
@@ -774,6 +909,38 @@ test_stage_six() {
     trap - ERR
 }
 
+test_stage_seven() {
+    local qdiscs
+
+    require_stage_seven_topology
+    trap 'set_nat_mode off; remove_qos; stop_captures' ERR
+
+    assert_interface lab-client eth0 10.10.1.2/24
+    assert_interface lab-router eth0 10.10.1.1/24
+    assert_interface lab-router eth1 10.10.2.1/24
+    assert_interface lab-fw eth0 10.10.2.2/24
+    assert_interface lab-fw eth1 10.10.3.1/24
+    assert_interface lab-server eth0 10.10.3.2/24
+
+    test_stage_two
+    test_stage_three
+
+    printf '\n[iperf3]\n'
+    ip netns exec lab-client iperf3 -c 10.10.3.2 -t 2
+
+    test_stage_four
+    test_stage_five
+    test_stage_six
+
+    [[ "$(show_nat_mode)" == "off" ]]
+    qdiscs=$(ip netns exec lab-fw tc qdisc show dev eth0)
+    [[ "$qdiscs" != *" tbf "* && "$qdiscs" != *" netem "* ]]
+    [[ ! -d "$CAPTURE_PID_DIR" ]]
+
+    trap - ERR
+    printf '\nStage 7 full test passed; optional modes restored to off.\n'
+}
+
 show_status() {
     local namespace
 
@@ -806,7 +973,20 @@ show_status() {
         ip netns exec lab-fw tc -s qdisc show dev eth0
     fi
     if [[ -r "$HTTP_PID_FILE" ]]; then
-        printf '\nHTTP PID: %s\n' "$(<"$HTTP_PID_FILE")"
+        pid=$(<"$HTTP_PID_FILE")
+        if is_project_http_pid "$pid"; then
+            printf '\nHTTP: running pid=%s\n' "$pid"
+        else
+            printf '\nHTTP: stale pid=%s\n' "$pid"
+        fi
+    fi
+    if [[ -r "$IPERF_PID_FILE" ]]; then
+        pid=$(<"$IPERF_PID_FILE")
+        if is_project_iperf_pid "$pid"; then
+            printf 'iperf3: running pid=%s\n' "$pid"
+        else
+            printf 'iperf3: stale pid=%s\n' "$pid"
+        fi
     fi
     if [[ -f "$STAGE6_READY_FILE" ]]; then
         printf '\n[packet capture]\n'
@@ -835,6 +1015,7 @@ main() {
                 4) require_root; setup_stage_four ;;
                 5) require_root; setup_stage_five ;;
                 6) require_root; setup_stage_six ;;
+                7) require_root; setup_stage_seven ;;
             esac
             ;;
         test)
@@ -849,6 +1030,7 @@ main() {
                 4) require_root; test_stage_four ;;
                 5) require_root; test_stage_five ;;
                 6) require_root; test_stage_six ;;
+                7) require_root; test_stage_seven ;;
             esac
             ;;
         nat)
@@ -899,6 +1081,7 @@ main() {
             [[ $# -eq 1 ]] || { usage >&2; return 2; }
             require_root
             cleanup_stage_one
+            verify_cleanup
             printf 'Lab resources removed.\n'
             ;;
         -h | --help)

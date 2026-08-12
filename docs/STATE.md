@@ -1,7 +1,7 @@
 # Project State
 
-- Current completed stage: Stage 6
-- Important files: `README.md`, `lab.sh`, `docs/labs/stage-0.md` through `docs/labs/stage-6.md`
+- Current completed stage: Stage 7
+- Important files: `README.md`, `lab.sh`, `docs/labs/stage-0.md` through `docs/labs/stage-7.md`
 - Active design decisions:
   - Build the lab cumulatively, one requested stage at a time.
   - Use four fixed namespace names and three veth pairs with short temporary host names.
@@ -15,7 +15,9 @@
   - Start Stage 5 with QoS off and allow removal without rebuilding.
   - Capture ICMP and TCP/8080 at all six namespace interfaces.
   - Preserve pcap files after stopping while cleaning every tcpdump process.
+  - Run HTTP on TCP/8080 and iperf3 on TCP/5201 inside `lab-server`.
+  - Restore NAT, QoS, and capture to off/stopped after the full test.
   - Rebuild the cumulative topology from clean project-owned resources.
   - Use Bash and standard Linux networking tools only.
 - Known problems: none
-- Next stage: Stage 7 — final tests, cleanup, documentation, and robustness
+- Next stage: none — all planned stages are complete
