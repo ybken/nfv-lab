@@ -17,7 +17,7 @@ lab-client          lab-router           lab-fw              lab-server
 client -- router -- firewall -- server
 ```
 
-Stage 0 只建立仓库和文档骨架，不创建 namespace、veth、地址、路由或防火墙规则。
+Stage 1 创建 namespace、veth 和接口地址，只支持相邻节点通信；尚未启用转发、静态路由或防火墙规则。
 
 ## 仓库结构
 
@@ -28,18 +28,18 @@ Stage 0 只建立仓库和文档骨架，不创建 namespace、veth、地址、�
 └── docs
     ├── STATE.md
     └── labs
-        └── stage-0.md
+        ├── stage-0.md
+        └── stage-1.md
 ```
 
-## Stage 0 使用
+## Stage 1 使用
 
-环境检查不会修改系统：
+环境检查不会修改系统。拓扑操作需要 root 权限：
 
 ```bash
 ./lab.sh check
-./lab.sh status
-./lab.sh test 0
+sudo ./lab.sh up 1
+sudo ./lab.sh test 1
+sudo ./lab.sh status
+sudo ./lab.sh down
 ```
-
-当前阶段不需要也不应使用 `sudo`。后续阶段的特权命令将在对应阶段实现后说明。
-
