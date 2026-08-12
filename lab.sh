@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly COMPLETED_STAGE=4
+readonly COMPLETED_STAGE=5
 readonly -a NAMESPACES=(lab-client lab-router lab-fw lab-server)
 readonly -a HOST_VETHS=(lab-c lab-r0 lab-r1 lab-f0 lab-f1 lab-s)
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -9,26 +9,30 @@ readonly SCRIPT_DIR
 readonly RUNTIME_DIR="$SCRIPT_DIR/run"
 readonly HTTP_PID_FILE="$RUNTIME_DIR/http.pid"
 readonly HTTP_LOG="$RUNTIME_DIR/http.log"
+readonly QOS_PAYLOAD="$RUNTIME_DIR/qos.bin"
+readonly QOS_READY_FILE="$RUNTIME_DIR/stage5.ready"
 
 usage() {
     cat <<'EOF'
 Usage:
   ./lab.sh check
-  sudo ./lab.sh up <0|1|2|3|4>
-  sudo ./lab.sh test <0|1|2|3|4>
+  sudo ./lab.sh up <0|1|2|3|4|5>
+  sudo ./lab.sh test <0|1|2|3|4|5>
   sudo ./lab.sh nat <off|snat|dnat>
+  sudo ./lab.sh qos off
+  sudo ./lab.sh qos set <rate> <delay> <loss>
   sudo ./lab.sh status
   sudo ./lab.sh down
 EOF
 }
 
 check_environment() {
-    local -a required=(bash ip sysctl ping iptables curl python3 conntrack)
-    local -a optional=(tc iperf3 tcpdump shellcheck)
+    local -a required=(bash ip sysctl ping iptables curl python3 conntrack tc truncate awk)
+    local -a optional=(iperf3 tcpdump shellcheck)
     local tool
     local missing=0
 
-    printf 'Required tools through Stage 4:\n'
+    printf 'Required tools through Stage 5:\n'
     for tool in "${required[@]}"; do
         if command -v "$tool" >/dev/null 2>&1; then
             printf '  [ok] %s\n' "$tool"
@@ -53,8 +57,8 @@ check_environment() {
 require_supported_stage() {
     local stage=${1:-}
 
-    if [[ ! "$stage" =~ ^[01234]$ ]]; then
-        printf 'Supported stages: 0 through 4; requested stage: %s\n' "${stage:-<missing>}" >&2
+    if [[ ! "$stage" =~ ^[012345]$ ]]; then
+        printf 'Supported stages: 0 through 5; requested stage: %s\n' "${stage:-<missing>}" >&2
         return 2
     fi
 }
@@ -78,7 +82,7 @@ is_project_http_pid() {
     [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
     command_line=$(tr '\0' ' ' <"/proc/$pid/cmdline")
     [[ "$command_line" == *"python3 -m http.server 8080"* &&
-        "$command_line" == *"--directory $SCRIPT_DIR/docs"* ]]
+        "$command_line" == *"--directory $SCRIPT_DIR"* ]]
 }
 
 stop_http_server() {
@@ -108,6 +112,7 @@ cleanup_stage_one() {
     local link
 
     stop_http_server
+    rm -f "$QOS_PAYLOAD" "$QOS_READY_FILE"
 
     for namespace in "${NAMESPACES[@]}"; do
         if namespace_exists "$namespace"; then
@@ -227,7 +232,7 @@ start_http_server() {
     stop_http_server
 
     ip netns exec lab-server python3 -m http.server 8080 \
-        --bind 10.10.3.2 --directory "$SCRIPT_DIR/docs" \
+        --bind 10.10.3.2 --directory "$SCRIPT_DIR" \
         >"$HTTP_LOG" 2>&1 &
     printf '%s\n' "$!" >"$HTTP_PID_FILE"
 }
@@ -237,7 +242,7 @@ wait_for_http_server() {
 
     for ((attempt = 1; attempt <= 10; attempt++)); do
         if ip netns exec lab-client curl -fsS --max-time 1 \
-            http://10.10.3.2:8080/STATE.md >/dev/null; then
+            http://10.10.3.2:8080/docs/STATE.md >/dev/null; then
             return
         fi
         sleep 0.1
@@ -330,6 +335,57 @@ setup_stage_four() {
     printf 'Stage 4 is up with NAT disabled by default.\n'
 }
 
+validate_qos_parameters() {
+    local rate=$1
+    local delay=$2
+    local loss=$3
+
+    [[ "$rate" =~ ^[1-9][0-9]*(kbit|mbit|gbit)$ ]] || {
+        printf 'Invalid rate: %s (example: 4mbit).\n' "$rate" >&2
+        return 2
+    }
+    [[ "$delay" =~ ^[0-9]+(us|ms|s)$ ]] || {
+        printf 'Invalid delay: %s (example: 50ms).\n' "$delay" >&2
+        return 2
+    }
+    [[ "$loss" =~ ^([0-9]|[1-9][0-9])([.][0-9]+)?%$|^100([.]0+)?%$ ]] || {
+        printf 'Invalid loss: %s (range: 0%% through 100%%).\n' "$loss" >&2
+        return 2
+    }
+}
+
+set_qos() {
+    local rate=$1
+    local delay=$2
+    local loss=$3
+
+    validate_qos_parameters "$rate" "$delay" "$loss"
+    ip netns exec lab-fw tc qdisc replace dev eth0 root handle 1: \
+        tbf rate "$rate" burst 32kbit latency 400ms
+    ip netns exec lab-fw tc qdisc replace dev eth0 parent 1:1 handle 10: \
+        netem delay "$delay" loss "$loss"
+    printf 'QoS: rate=%s delay=%s loss=%s\n' "$rate" "$delay" "$loss"
+}
+
+remove_qos() {
+    ip netns exec lab-fw tc qdisc delete dev eth0 root 2>/dev/null || true
+    printf 'QoS: off\n'
+}
+
+setup_stage_five() {
+    trap 'cleanup_stage_one' ERR
+
+    setup_stage_four
+    trap 'cleanup_stage_one' ERR
+
+    truncate -s 2M "$QOS_PAYLOAD"
+    touch "$QOS_READY_FILE"
+    remove_qos
+
+    trap - ERR
+    printf 'Stage 5 is up with QoS disabled by default.\n'
+}
+
 require_stage_one_topology() {
     local namespace
 
@@ -348,6 +404,14 @@ require_stage_four_topology() {
     rules=$(ip netns exec lab-fw iptables -S FORWARD)
     if [[ "$rules" != *"stage4-snat-http-new"* ]]; then
         printf 'Stage 4 is not active. Run: sudo ./lab.sh up 4\n' >&2
+        return 1
+    fi
+}
+
+require_stage_five_topology() {
+    require_stage_four_topology
+    if [[ ! -f "$QOS_READY_FILE" || ! -f "$QOS_PAYLOAD" ]]; then
+        printf 'Stage 5 is not active. Run: sudo ./lab.sh up 5\n' >&2
         return 1
     fi
 }
@@ -454,7 +518,7 @@ test_stage_three() {
     ip netns exec lab-client ping -c 2 -W 1 10.10.3.2
 
     response=$(ip netns exec lab-client curl -fsS --max-time 3 \
-        http://10.10.3.2:8080/STATE.md)
+        http://10.10.3.2:8080/docs/STATE.md)
     if [[ "$response" != *"# Project State"* ]]; then
         printf 'Unexpected HTTP response from server.\n' >&2
         return 1
@@ -491,7 +555,7 @@ test_stage_four() {
 
     set_nat_mode snat
     response=$(ip netns exec lab-client curl -fsS --max-time 3 \
-        http://10.10.3.2:8080/STATE.md)
+        http://10.10.3.2:8080/docs/STATE.md)
     [[ "$response" == *"# Project State"* ]]
     entries=$(ip netns exec lab-router conntrack -L -p tcp --dport 8080 2>/dev/null)
     assert_conntrack_contains "$entries" 'src=10.10.1.2 dst=10.10.3.2' SNAT
@@ -502,7 +566,7 @@ test_stage_four() {
 
     set_nat_mode dnat
     response=$(ip netns exec lab-client curl -fsS --max-time 3 \
-        http://10.10.1.1:8080/STATE.md)
+        http://10.10.1.1:8080/docs/STATE.md)
     [[ "$response" == *"# Project State"* ]]
     entries=$(ip netns exec lab-router conntrack -L -p tcp --dport 8080 2>/dev/null)
     assert_conntrack_contains "$entries" 'src=10.10.1.2 dst=10.10.1.1' DNAT
@@ -512,6 +576,39 @@ test_stage_four() {
     printf '%s\n' "$entries"
 
     set_nat_mode off
+    trap - ERR
+}
+
+test_stage_five() {
+    local qdiscs
+    local speed
+
+    require_stage_five_topology
+    trap 'remove_qos' ERR
+
+    set_qos 4mbit 50ms 1%
+    qdiscs=$(ip netns exec lab-fw tc qdisc show dev eth0)
+    [[ "$qdiscs" == *"qdisc tbf 1:"* && "$qdiscs" == *"rate 4Mbit"* ]]
+    [[ "$qdiscs" == *"qdisc netem 10:"* && "$qdiscs" == *"delay 50ms"* &&
+        "$qdiscs" == *"loss 1%"* ]]
+
+    speed=$(ip netns exec lab-client curl -fsS --max-time 15 \
+        -o /dev/null -w '%{speed_download}' \
+        http://10.10.3.2:8080/run/qos.bin)
+    if ! awk -v speed="$speed" 'BEGIN { exit !(speed > 0 && speed <= 700000) }'; then
+        printf 'Unexpected download rate: %s bytes/s.\n' "$speed" >&2
+        return 1
+    fi
+    printf '[ok] Download limited to %s bytes/s\n' "$speed"
+    ip netns exec lab-client ping -c 3 -W 2 10.10.3.2
+    ip netns exec lab-fw tc -s qdisc show dev eth0
+
+    remove_qos
+    qdiscs=$(ip netns exec lab-fw tc qdisc show dev eth0)
+    if [[ "$qdiscs" == *" tbf "* || "$qdiscs" == *" netem "* ]]; then
+        printf 'QoS qdisc remains after removal.\n' >&2
+        return 1
+    fi
     trap - ERR
 }
 
@@ -542,6 +639,10 @@ show_status() {
         printf '\n'
         ip netns exec lab-router iptables -t nat -L -v -n --line-numbers
     fi
+    if namespace_exists lab-fw; then
+        printf '\n[lab-fw QoS on eth0]\n'
+        ip netns exec lab-fw tc -s qdisc show dev eth0
+    fi
     if [[ -r "$HTTP_PID_FILE" ]]; then
         printf '\nHTTP PID: %s\n' "$(<"$HTTP_PID_FILE")"
     fi
@@ -566,6 +667,7 @@ main() {
                 2) require_root; setup_stage_two ;;
                 3) require_root; setup_stage_three ;;
                 4) require_root; setup_stage_four ;;
+                5) require_root; setup_stage_five ;;
             esac
             ;;
         test)
@@ -578,6 +680,7 @@ main() {
                 2) require_root; test_stage_two ;;
                 3) require_root; test_stage_three ;;
                 4) require_root; test_stage_four ;;
+                5) require_root; test_stage_five ;;
             esac
             ;;
         nat)
@@ -585,6 +688,24 @@ main() {
             require_root
             require_stage_four_topology
             set_nat_mode "$2"
+            ;;
+        qos)
+            require_root
+            require_stage_five_topology
+            case "${2:-}" in
+                off)
+                    [[ $# -eq 2 ]] || { usage >&2; return 2; }
+                    remove_qos
+                    ;;
+                set)
+                    [[ $# -eq 5 ]] || { usage >&2; return 2; }
+                    set_qos "$3" "$4" "$5"
+                    ;;
+                *)
+                    usage >&2
+                    return 2
+                    ;;
+            esac
             ;;
         status)
             [[ $# -eq 1 ]] || { usage >&2; return 2; }
