@@ -17,7 +17,7 @@ lab-client          lab-router           lab-fw              lab-server
 client -- router -- firewall -- server
 ```
 
-Stage 1 创建 namespace、veth 和接口地址，只支持相邻节点通信；尚未启用转发、静态路由或防火墙规则。
+Stage 2 添加静态路由，并仅在 router 和 firewall namespace 中启用 IPv4 转发；尚未添加防火墙或 NAT。
 
 ## 仓库结构
 
@@ -29,17 +29,18 @@ Stage 1 创建 namespace、veth 和接口地址，只支持相邻节点通信；
     ├── STATE.md
     └── labs
         ├── stage-0.md
-        └── stage-1.md
+        ├── stage-1.md
+        └── stage-2.md
 ```
 
-## Stage 1 使用
+## Stage 2 使用
 
 环境检查不会修改系统。拓扑操作需要 root 权限：
 
 ```bash
 ./lab.sh check
-sudo ./lab.sh up 1
-sudo ./lab.sh test 1
+sudo ./lab.sh up 2
+sudo ./lab.sh test 2
 sudo ./lab.sh status
 sudo ./lab.sh down
 ```
